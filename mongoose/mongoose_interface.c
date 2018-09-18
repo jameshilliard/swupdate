@@ -58,6 +58,61 @@ struct file_upload_state {
 static struct mg_serve_http_opts s_http_server_opts;
 static void upload_handler(struct mg_connection *nc, int ev, void *p);
 
+#ifdef CONFIG_DOWNLOAD
+/*
+ * Downloader
+ */
+#include <pthread.h>
+#include "download_interface.h"
+#include "channel.h"
+#include "channel_curl.h"
+#include "globals.h"
+
+struct downloader_thread_argvs{
+	char *url;
+};
+
+#define DL_LOWSPEED_TIME	300
+
+#define DL_DEFAULT_RETRIES	3
+
+#define SETSTRING(p, v) do { \
+	if (p) \
+		free(p); \
+	p = strdup(v); \
+} while (0)
+
+static channel_data_t channel_options = {
+	.source = SOURCE_DOWNLOADER,
+	.debug = false,
+	.retries = DL_DEFAULT_RETRIES,
+	.low_speed_timeout = DL_LOWSPEED_TIME
+};
+
+static void download_handler(struct mg_connection *nc, int ev, void *p);
+static void *start_download_thread(void *argv);
+
+
+static RECOVERY_STATUS download_from_url(channel_data_t* channel_data)
+{
+	channel_t *channel = channel_new();
+	if (channel->open(channel, channel_data) != CHANNEL_OK) {
+		free(channel);
+		return FAILURE;
+	}
+
+	RECOVERY_STATUS result = SUCCESS;
+	channel_op_res_t chanresult = channel->get_file(channel, channel_data);
+	if (chanresult != CHANNEL_OK) {
+		result = FAILURE;
+	}
+	ipc_wait_for_complete(NULL);
+	channel->close(channel);
+	free(channel);
+	return result;
+}
+#endif
+
 /*
  * These functions are for V2 of the protocol
  */
@@ -430,6 +485,29 @@ static void upload_handler(struct mg_connection *nc, int ev, void *p)
 	}
 }
 
+#ifdef CONFIG_DOWNLOAD
+static void download_handler(struct mg_connection *nc, int ev, void *p)
+{
+		struct http_message *hm = (struct http_message *) p;
+
+		char url[1024];
+		int ret = mg_get_http_var(&hm->body, "url", url, sizeof(url));
+		fprintf(stderr,"Received URL %d\n",ret);
+		if (ret==-1) {
+			mg_http_send_error(nc, 500, NULL);
+		} else {
+			pthread_t thread_download;
+			pthread_create(&thread_download, NULL, start_download_thread, (void *)&url);
+
+			mg_send_response_line(nc, 200,
+				"Content-Type: text/plain\r\n"
+				"Connection: close");
+			mg_send(nc, "\r\n", 2);
+			nc->flags |= MG_F_SEND_AND_CLOSE;
+		}
+}
+#endif
+
 static void ev_handler_v1(struct mg_connection __attribute__ ((__unused__)) *nc,
 				int __attribute__ ((__unused__)) ev,
 				void __attribute__ ((__unused__)) *ev_data)
@@ -637,6 +715,9 @@ int start_mongoose(const char *cfgfname, int argc, char *argv[])
 	case MONGOOSE_API_V2:
 		mg_register_http_endpoint(nc, "/restart", restart_handler);
 		mg_register_http_endpoint(nc, "/upload", MG_CB(upload_handler, NULL));
+#ifdef CONFIG_DOWNLOAD
+		mg_register_http_endpoint(nc, "/download", download_handler);
+#endif
 		mg_start_thread(broadcast_message_thread, &mgr);
 		mg_start_thread(broadcast_progress_thread, &mgr);
 		break;
@@ -654,3 +735,31 @@ int start_mongoose(const char *cfgfname, int argc, char *argv[])
 
 	return 0;
 }
+
+#ifdef CONFIG_DOWNLOAD
+static void *start_download_thread(void *argv)
+{
+	char *url;
+	if (argv) {
+		url=(char*) argv;
+
+		SETSTRING(channel_options.url, url);
+
+		optind = 1;
+
+		RECOVERY_STATUS result = download_from_url(&channel_options);
+		if (result != FAILURE) {
+			ipc_message msg;
+			if (ipc_postupdate(&msg) != 0) {
+				result = FAILURE;
+			} else {
+				result = msg.type == ACK ? result : FAILURE;
+			}
+		}
+
+		if (channel_options.url != NULL) {
+			free(channel_options.url);
+		}
+	}
+}
+#endif
