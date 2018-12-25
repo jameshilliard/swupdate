@@ -64,7 +64,7 @@ static bool is_type(lua_State *L, uintptr_t type)
 }
 #endif
 
-static void lua_dump_table(lua_State *L, char *str, struct img_type *img, const char *key)
+static void lua_dump_table(lua_State *L, char *str, struct img_type *img)
 {
 	/* Stack: table, ... */
 	lua_pushnil(L);
@@ -81,10 +81,11 @@ static void lua_dump_table(lua_State *L, char *str, struct img_type *img, const 
 					lua_tostring(L, -2));
 				if (img) {
 					TRACE("Inserting property %s[%s] = %s",
-							key,
+							str,
 							lua_tostring(L, -1),
 							lua_tostring(L, -2));
-					dict_insert_value(&img->properties, key,
+					dict_insert_value(&img->properties,
+							str,
 							lua_tostring(L, -2));
 				}
 				break;
@@ -103,7 +104,7 @@ static void lua_dump_table(lua_State *L, char *str, struct img_type *img, const 
 
 				if (asprintf(&s, "%s %s:", str, propkey) != ENOMEM_ASPRINTF) {
 					lua_pushvalue(L, -2);
-					lua_dump_table(L, s, img, propkey);
+					lua_dump_table(L, s, img);
 					lua_pop(L, 1);
 					free(s);
 				}
@@ -155,7 +156,7 @@ void LUAstackDump(lua_State *L)
 
 				if (asprintf(&s, "(%d) [table ]", i) != ENOMEM_ASPRINTF) {
 					lua_pushvalue(L, -1);
-					lua_dump_table(L, s, NULL, NULL);
+					lua_dump_table(L, s, NULL);
 					lua_pop(L, 1);
 					free(s);
 				}
@@ -592,7 +593,7 @@ static void table2image(lua_State* L, struct img_type *img) {
 					if (!strcmp (lua_tostring(L, -2), "properties")) {
 						dict_drop_db(&img->properties);
 						lua_pushvalue(L, -1);
-						lua_dump_table(L, (char*)"properties", img, NULL);
+						lua_dump_table(L, (char*)"properties", img);
 						lua_pop(L, 1);
 					}
 					break;
