@@ -79,6 +79,7 @@ static struct option long_options[] = {
 	{"output", required_argument, NULL, 'o'},
 	{"dry-run", no_argument, NULL, 'n'},
 	{"no-downgrading", required_argument, NULL, 'N'},
+	{"no-reinstalling", required_argument, NULL, 'R'},
 #ifdef CONFIG_SIGNED_IMAGES
 	{"key", required_argument, NULL, 'k'},
 	{"ca-path", required_argument, NULL, 'k'},
@@ -117,51 +118,52 @@ static void usage(char *programname)
 	fprintf(stdout, "Usage %s [OPTION]\n",
 			programname);
 	fprintf(stdout,
-		" -f, --file <filename>          : configuration file to use\n"
+		" -f, --file <filename>           : configuration file to use\n"
 #ifdef CONFIG_UBIATTACH
-		" -b, --blacklist <list of mtd>  : MTDs that must not be scanned for UBI\n"
+		" -b, --blacklist <list of mtd>   : MTDs that must not be scanned for UBI\n"
 #endif
-		" -p, --postupdate               : execute post-update command\n"
-		" -e, --select <software>,<mode> : Select software images set and source\n"
-		"                                  Ex.: stable,main\n"
-		" -i, --image <filename>         : Software to be installed\n"
-		" -l, --loglevel <level>         : logging level\n"
-		" -L, --syslog                   : enable syslog logger\n"
+		" -p, --postupdate                : execute post-update command\n"
+		" -e, --select <software>,<mode>  : Select software images set and source\n"
+		"                                   Ex.: stable,main\n"
+		" -i, --image <filename>          : Software to be installed\n"
+		" -l, --loglevel <level>          : logging level\n"
+		" -L, --syslog                    : enable syslog logger\n"
 #ifdef CONFIG_SIGNED_IMAGES
-		" -k, --key <public key file>    : file with public key to verify images\n"
-		"     --cert-purpose <purpose>   : set expected certificate purpose\n"
-		"                                  [emailProtection|codeSigning] (default: emailProtection)\n"
-		"     --forced-signer-name <cn>  : set expected common name of signer certificate\n"
-		"     --ca-path                  : path to the Certificate Authority (PEM)\n"
+		" -k, --key <public key file>     : file with public key to verify images\n"
+		"     --cert-purpose <purpose>    : set expected certificate purpose\n"
+		"                                   [emailProtection|codeSigning] (default: emailProtection)\n"
+		"     --forced-signer-name <cn>   : set expected common name of signer certificate\n"
+		"     --ca-path                   : path to the Certificate Authority (PEM)\n"
 #endif
 #ifdef CONFIG_ENCRYPTED_IMAGES
-		" -K, --key-aes <key file>       : the file contains the symmetric key to be used\n"
-		"                                  to decrypt images\n"
+		" -K, --key-aes <key file>        : the file contains the symmetric key to be used\n"
+		"                                   to decrypt images\n"
 #endif
-		" -n, --dry-run                  : run SWUpdate without installing the software\n"
-		" -N, --no-downgrading <version> : not install a release older as <version>\n"
-		" -o, --output <output file>     : saves the incoming stream\n"
-		" -v, --verbose                  : be verbose, set maximum loglevel\n"
-		"     --version                  : print SWUpdate version and exit\n"
+		" -n, --dry-run                   : run SWUpdate without installing the software\n"
+		" -N, --no-downgrading <version>  : not install a release older as <version>\n"
+		" -R, --no-reinstalling <version> : not install a release same as <version>\n"
+		" -o, --output <output file>      : saves the incoming stream\n"
+		" -v, --verbose                   : be verbose, set maximum loglevel\n"
+		"     --version                   : print SWUpdate version and exit\n"
 #ifdef CONFIG_HW_COMPATIBILITY
-		" -H, --hwrevision <board>:<rev> : Set hardware revision\n"
+		" -H, --hwrevision <board>:<rev>  : Set hardware revision\n"
 #endif
-		" -c, --check                    : check image and exit, use with -i <filename>\n"
-		" -h, --help                     : print this help and exit\n"
+		" -c, --check                     : check image and exit, use with -i <filename>\n"
+		" -h, --help                      : print this help and exit\n"
 		);
 #ifdef CONFIG_DOWNLOAD
 	fprintf(stdout,
-		" -d, --download [OPTIONS]       : Parameters to be passed to the downloader\n");
+		" -d, --download [OPTIONS]        : Parameters to be passed to the downloader\n");
 	download_print_help();
 #endif
 #ifdef CONFIG_SURICATTA
 	fprintf(stdout,
-		" -u, --suricatta [OPTIONS]      : Parameters to be passed to suricatta\n");
+		" -u, --suricatta [OPTIONS]       : Parameters to be passed to suricatta\n");
 	suricatta_print_help();
 #endif
 #ifdef CONFIG_WEBSERVER
 	fprintf(stdout,
-		" -w, --webserver [OPTIONS]      : Parameters to be passed to webserver\n");
+		" -w, --webserver [OPTIONS]       : Parameters to be passed to webserver\n");
 	mongoose_print_help();
 #endif
 }
@@ -503,9 +505,13 @@ static int read_globals_settings(void *elem, void *data)
 	get_field(LIBCFG_PARSER, elem, "loglevel", &sw->globals.loglevel);
 	get_field(LIBCFG_PARSER, elem, "syslog", &sw->globals.syslog_enabled);
 	GET_FIELD_STRING(LIBCFG_PARSER, elem,
-				"no-downgrading", sw->globals.current_version);
-	if (strlen(sw->globals.current_version))
+				"no-downgrading", sw->globals.minimum_version);
+	if (strlen(sw->globals.minimum_version))
 		sw->globals.no_downgrading = 1;
+	GET_FIELD_STRING(LIBCFG_PARSER, elem,
+				"no-reinstalling", sw->globals.current_version);
+	if (strlen(sw->globals.current_version))
+		sw->globals.no_reinstalling = 1;
 	GET_FIELD_STRING(LIBCFG_PARSER, elem,
 				"cert-purpose", tmp);
 	if (tmp[0] != '\0')
@@ -598,7 +604,7 @@ int main(int argc, char **argv)
 #endif
 	memset(main_options, 0, sizeof(main_options));
 	memset(image_url, 0, sizeof(image_url));
-	strcpy(main_options, "vhni:e:l:Lcf:p:o:N:");
+	strcpy(main_options, "vhni:e:l:Lcf:p:o:N:R:");
 #ifdef CONFIG_MTD
 	strcat(main_options, "b:");
 #endif
@@ -741,6 +747,11 @@ int main(int argc, char **argv)
 #endif
 		case 'N':
 			swcfg.globals.no_downgrading = 1;
+			strncpy(swcfg.globals.minimum_version, optarg,
+				sizeof(swcfg.globals.minimum_version));
+			break;
+		case 'R':
+			swcfg.globals.no_reinstalling = 1;
 			strncpy(swcfg.globals.current_version, optarg,
 				sizeof(swcfg.globals.current_version));
 			break;
