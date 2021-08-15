@@ -22,6 +22,7 @@ obj-y += swupdate.o \
 	 network_thread.o \
 	 stream_interface.o \
 	 progress_thread.o \
+	 status_thread.o \
 	 parsing_library.o \
 	 artifacts_versions.o \
 	 swupdate_dict.o \

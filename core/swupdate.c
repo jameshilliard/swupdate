@@ -43,6 +43,7 @@
 #include "sslapi.h"
 #include "suricatta/suricatta.h"
 #include "progress.h"
+#include "status.h"
 #include "parselib.h"
 #include "swupdate_settings.h"
 #include "pctl.h"
@@ -859,6 +860,8 @@ int main(int argc, char **argv)
 	network_daemon = start_thread(network_initializer, &swcfg);
 
 	start_thread(progress_bar_thread, NULL);
+
+	start_thread(status_thread, NULL);
 
 	/* wait for threads to be done before starting children */
 	wait_threads_ready();

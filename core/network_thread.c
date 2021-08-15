@@ -106,16 +106,6 @@ static bool is_selection_allowed(const char *software_set, char *running_mode,
 	return allowed;
 }
 
-static void clean_msg(char *msg, char drop)
-{
-	char *lfpos;
-	lfpos = strchr(msg, drop);
-	while (lfpos) {
-		*lfpos = ' ';
-		lfpos = strchr(msg, drop);
-	}
-}
-
 static void network_notifier(RECOVERY_STATUS status, int error, int level, const char *msg)
 {
 	int len = msg ? strlen(msg) : 0;

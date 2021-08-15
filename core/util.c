@@ -1137,3 +1137,13 @@ bool img_check_free_space(struct img_type *img, int fd)
 
 	return check_free_space(fd, size, img->fname);
 }
+
+void clean_msg(char *msg, char drop)
+{
+	char *lfpos;
+	lfpos = strchr(msg, drop);
+	while (lfpos) {
+		*lfpos = ' ';
+		lfpos = strchr(msg, drop);
+	}
+}

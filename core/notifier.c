@@ -21,6 +21,7 @@
 #include "util.h"
 #include "pctl.h"
 #include "progress.h"
+#include "status.h"
 
 #ifdef CONFIG_SYSTEMD
 #include <sys/stat.h>
@@ -357,6 +358,18 @@ static void progress_notifier (RECOVERY_STATUS status, int event, int level, con
 	swupdate_progress_info(status, event, msg);
 }
 
+/*
+ * Status notifier: the message should be forwarded to the status
+ * interface only.
+ */
+static void status_notifier (RECOVERY_STATUS status, int event, int level, const char *msg)
+{
+	if (status == PROGRESS || event == RECOVERY_DWL)
+		return;
+
+	swupdate_status_info(status, event, level, msg);
+}
+
 
 #if defined(__FreeBSD__)
 static char* socket_path = NULL;
@@ -526,6 +539,7 @@ void notify_init(void)
 		register_notifier(console_notifier);
 		register_notifier(process_notifier);
 		register_notifier(progress_notifier);
+		register_notifier(status_notifier);
 		start_thread(notifier_thread, NULL);
 	}
 }

@@ -215,6 +215,11 @@ config SOCKET_PROGRESS_PATH
 	help
 	  Path to the socket progress information is sent to.
 
+config SOCKET_STATUS_PATH
+	string "SWUpdate status socket path"
+	help
+	  Path to the socket status information is sent to.
+
 config SOCKET_NOTIFIER_DIRECTORY
 	string "SWUpdate notifier socket directory"
 	depends on HAVE_FREEBSD
