@@ -258,13 +258,16 @@ int install_images(struct swupdate_cfg *sw)
 	bool dry_run = sw->parms.dry_run;
 	bool dropimg;
 
+	/* Create directories for scripts */
+	create_directory(SCRIPTS_DIR_SUFFIX);
+
 	/* Extract all scripts, preinstall scripts must be run now */
 	const char* tmpdir_scripts = get_tmpdirscripts();
 	ret = extract_scripts(&sw->scripts);
 	ret |= extract_scripts(&sw->bootscripts);
 	if (ret) {
 		ERROR("extracting script to %s failed", tmpdir_scripts);
-		return ret;
+		goto out;
 	}
 
 	/* Scripts must be run before installing images */
@@ -272,7 +275,7 @@ int install_images(struct swupdate_cfg *sw)
 		ret = run_prepost_scripts(&sw->scripts, PREINSTALL);
 		if (ret) {
 			ERROR("execute preinstall scripts failed");
-			return ret;
+			goto out;
 		}
 	}
 
@@ -293,14 +296,16 @@ int install_images(struct swupdate_cfg *sw)
 		if (asprintf(&filename, "%s%s", TMPDIR, img->fname) ==
 				ENOMEM_ASPRINTF) {
 				ERROR("Path too long: %s%s", TMPDIR, img->fname);
-				return -1;
+				ret = -1;
+				goto out;
 		}
 
 		ret = stat(filename, &buf);
 		if (ret) {
 			TRACE("%s not found or wrong", filename);
 			free(filename);
-			return -1;
+			ret = -1;
+			goto out;
 		}
 		img->size = buf.st_size;
 		img->fdin = open(filename, O_RDONLY);
@@ -308,7 +313,8 @@ int install_images(struct swupdate_cfg *sw)
 		if (img->fdin < 0) {
 			ERROR("Image %s cannot be opened",
 			img->fname);
-			return -1;
+			ret = -1;
+			goto out;
 		}
 
 		if ((strlen(img->path) > 0) &&
@@ -337,20 +343,20 @@ int install_images(struct swupdate_cfg *sw)
 			free_image(img);
 
 		if (ret)
-			return ret;
+			goto out;
 	}
 
 	/*
 	 * Skip scripts in dry-run mode
 	 */
 	if (dry_run) {
-		return ret;
+		goto out;
 	}
 
 	ret = run_prepost_scripts(&sw->scripts, POSTINSTALL);
 	if (ret) {
 		ERROR("execute postinstall scripts failed");
-		return ret;
+		goto out;
 	}
 
 	if (!LIST_EMPTY(&sw->bootloader)) {
@@ -358,11 +364,16 @@ int install_images(struct swupdate_cfg *sw)
 		sprintf(bootscript, "%s%s", TMPDIR, BOOT_SCRIPT_SUFFIX);
 		ret = update_bootloader_env(sw, bootscript);
 		if (ret) {
-			return ret;
+			goto out;
 		}
 	}
 
 	ret |= run_prepost_scripts(&sw->bootscripts, POSTINSTALL);
+
+out:
+#ifndef CONFIG_NOCLEANUP
+	remove_directory(SCRIPTS_DIR_SUFFIX);
+#endif
 
 	return ret;
 }

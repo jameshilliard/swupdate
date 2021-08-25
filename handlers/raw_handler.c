@@ -218,23 +218,29 @@ static int install_raw_file(struct img_type *img,
 		return -1;
 	}
 
+	/* Create directories for datadst */
+	create_directory(DATADST_DIR_SUFFIX);
+
 	if (use_mount) {
 		ret = swupdate_mount(img->device, DATADST_DIR, img->filesystem);
 		if (ret) {
 			ERROR("Device %s with filesystem %s cannot be mounted: %s",
 				img->device, img->filesystem, strerror(errno));
-			return -1;
+			ret = -1;
+			goto out;
 		}
 
 		if (snprintf(path, sizeof(path), "%s%s",
 					 DATADST_DIR, img->path) >= (int)sizeof(path)) {
 			ERROR("Path too long: %s%s", DATADST_DIR, img->path);
-			return -1;
+			ret = -1;
+			goto out;
 		}
 	} else {
 		if (snprintf(path, sizeof(path), "%s", img->path) >= (int)sizeof(path)) {
 			ERROR("Path too long: %s", img->path);
-			return -1;
+			ret = -1;
+			goto out;
 		}
 	}
 
@@ -248,15 +254,19 @@ static int install_raw_file(struct img_type *img,
 		fdout = mkpath(dirname(strdupa(path)), 0755);
 		if (fdout < 0) {
 			ERROR("I cannot create path %s: %s", path, strerror(errno));
-			return -1;
+			ret = -1;
+			goto out;
 		}
 	}
 
 	fdout = openfileoutput(path);
-	if (fdout < 0)
-		return fdout;
+	if (fdout < 0) {
+		ret = fdout;
+		goto out;
+	}
 	if (!img_check_free_space(img, fdout)) {
-		return -ENOSPC;
+		ret = -ENOSPC;
+		goto out;
 	}
 
 	ret = copyimage(&fdout, img, NULL);
@@ -268,6 +278,11 @@ static int install_raw_file(struct img_type *img,
 	if (use_mount) {
 		swupdate_umount(DATADST_DIR);
 	}
+
+out:
+#ifndef CONFIG_NOCLEANUP
+	remove_directory(DATADST_DIR_SUFFIX);
+#endif
 
 	return ret;
 }

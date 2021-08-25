@@ -279,6 +279,9 @@ static int apply_rdiff_patch(struct img_type *img,
 			return -1;
 		}
 
+		/* Create directories for datadst */
+		create_directory(DATADST_DIR_SUFFIX);
+
 		base_file_filename = img->path;
 		if (use_mount) {
 			mountpoint = alloca(strlen(get_tmpdir()) + strlen(DATADST_DIR_SUFFIX) + 1);
@@ -432,6 +435,9 @@ cleanup:
 		if (use_mount == true) {
 			swupdate_umount(mountpoint);
 		}
+#ifndef CONFIG_NOCLEANUP
+		remove_directory(DATADST_DIR_SUFFIX);
+#endif
 	}
 	return ret;
 }

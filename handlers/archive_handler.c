@@ -217,6 +217,9 @@ static int install_archive_image(struct img_type *img,
 		return -EINVAL;
 	}
 
+	/* Create directories for datadst */
+	create_directory(DATADST_DIR_SUFFIX);
+
 	if ((asprintf(&DATADST_DIR, "%s%s", get_tmpdir(), DATADST_DIR_SUFFIX) ==
 		ENOMEM_ASPRINTF) ||
 		(asprintf(&FIFO, "%s%s", get_tmpdir(), FIFO_FILE_NAME) ==
@@ -363,6 +366,10 @@ out:
 
 	free(DATADST_DIR);
 	free(FIFO);
+
+#ifndef CONFIG_NOCLEANUP
+	remove_directory(DATADST_DIR_SUFFIX);
+#endif
 
 	return exitval;
 }
