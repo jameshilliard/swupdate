@@ -13,6 +13,7 @@ obj-$(CONFIG_BOOTLOADERHANDLER) += boot_handler.o
 obj-$(CONFIG_CFI)	+= flash_handler.o
 obj-$(CONFIG_DISKFORMAT_HANDLER)	+= diskformat_handler.o
 obj-$(CONFIG_DISKPART)	+= diskpart_handler.o
+obj-$(CONFIG_DISKPIVOT_HANDLER)	+= diskpivot_handler.o
 obj-$(CONFIG_UNIQUEUUID)	+= uniqueuuid_handler.o
 obj-$(CONFIG_CFIHAMMING1)+= flash_hamming1_handler.o
 obj-$(CONFIG_LUASCRIPTHANDLER) += lua_scripthandler.o

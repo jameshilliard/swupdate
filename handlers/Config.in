@@ -122,6 +122,13 @@ config DISKFORMAT_HANDLER
 	  The diskformat handler allows creating filesystems on empty
 	  partitions.
 
+config DISKPIVOT_HANDLER
+	bool "diskpivot handler for switching root device"
+	depends on HAVE_LIBSYSTEMD
+	default n
+	help
+	  The diskpivot handler allows switching root devices.
+
 source fs/Config.in
 
 config UNIQUEUUID
