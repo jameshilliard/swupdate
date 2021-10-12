@@ -26,16 +26,15 @@
 #include <parselib.h>
 #include <progress_ipc.h>
 #include <swupdate_settings.h>
-#include <time.h>
+#include <pctl.h>
+#include <pthread.h>
 
 #include "mongoose.h"
+#include "mongoose_multipart.h"
 #include "util.h"
 
 #define MG_PORT "8080"
 #define MG_ROOT "."
-
-/* in seconds. If no packet is received with this timeout, connection is broken */
-#define MG_TIMEOUT	120
 
 struct mongoose_options {
 	char *root;
@@ -57,8 +56,224 @@ struct file_upload_state {
 
 static bool run_postupdate;
 static unsigned int watchdog_conn = 0;
-static struct mg_serve_http_opts s_http_server_opts;
-static void upload_handler(struct mg_connection *nc, int ev, void *p);
+static struct mg_http_serve_opts s_http_server_opts;
+const char *global_auth_domain;
+const char *global_auth_file;
+#if MG_ENABLE_SSL
+static bool ssl;
+static struct mg_tls_opts tls_opts;
+#endif
+
+struct ws_msg_elem {
+	char *msg;
+	SIMPLEQ_ENTRY(ws_msg_elem) next;
+};
+
+SIMPLEQ_HEAD(ws_msglist, ws_msg_elem);
+static struct ws_msglist ws_messages;
+
+static pthread_mutex_t ws_msg_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static struct mg_connection *ws_pipe;
+
+static int s_signo;
+static void signal_handler(int signo) {
+	s_signo = signo;
+}
+
+static int p_stat(const char *path, size_t *size, time_t *mtime)
+{
+	int flags = mg_fs_posix.stat(path, size, mtime);
+	if (flags & MG_FS_DIR && strcmp(s_http_server_opts.root_dir, path) != 0)
+		return 0;
+	return flags;
+}
+
+static void p_list(const char *path, void (*fn)(const char *, void *), void *userdata)
+{
+	(void) path, (void) fn, (void) userdata;
+}
+
+static struct mg_fd *p_open(const char *path, int flags)
+{
+	return mg_fs_posix.open(path, flags);
+}
+
+static void p_close(struct mg_fd *fd)
+{
+	return mg_fs_posix.close(fd);
+}
+
+static size_t p_read(void *fd, void *buf, size_t len)
+{
+	return mg_fs_posix.read(fd, buf, len);
+}
+
+static size_t p_write(void *fd, const void *buf, size_t len)
+{
+	return mg_fs_posix.write(fd, buf, len);
+}
+
+static size_t p_seek(void *fd, size_t offset)
+{
+	return mg_fs_posix.seek(fd, offset);
+}
+
+/* mg_fs which inhibits directory listing functionality */
+static struct mg_fs fs_posix_no_list = {
+		p_stat,
+		p_list,
+		p_open,
+		p_close,
+		p_read,
+		p_write,
+		p_seek
+};
+
+/*
+ * Minimal forward port of mongoose digest auth support.
+ */
+static void mg_hash_md5_v(size_t num_msgs, const uint8_t *msgs[],
+				   const size_t *msg_lens, uint8_t *digest)
+{
+	size_t i;
+	mg_md5_ctx md5_ctx;
+	mg_md5_init(&md5_ctx);
+	for (i = 0; i < num_msgs; i++) {
+		mg_md5_update(&md5_ctx, msgs[i], msg_lens[i]);
+	}
+	mg_md5_final(&md5_ctx, digest);
+}
+
+static void cs_md5(char buf[33], ...) {
+	unsigned char hash[16];
+	const uint8_t *msgs[20], *p;
+	size_t msg_lens[20];
+	size_t num_msgs = 0;
+	va_list ap;
+
+	va_start(ap, buf);
+	while ((p = va_arg(ap, const unsigned char *)) != NULL) {
+		msgs[num_msgs] = p;
+		msg_lens[num_msgs] = va_arg(ap, size_t);
+		num_msgs++;
+	}
+	va_end(ap);
+
+	mg_hash_md5_v(num_msgs, msgs, msg_lens, hash);
+	mg_hex(hash, sizeof(hash), buf);
+}
+
+static void mg_mkmd5resp(struct mg_str method, struct mg_str uri, struct mg_str ha1,
+						 struct mg_str nonce, struct mg_str nc, struct mg_str cnonce,
+						 struct mg_str qop, char *resp)
+{
+	static const char colon[] = ":";
+	static const size_t one = 1;
+	char ha2[33];
+	cs_md5(ha2, method.ptr, method.len, colon, one, uri.ptr, uri.len, NULL);
+	cs_md5(resp, ha1.ptr, ha1.len, colon, one, nonce.ptr, nonce.len, colon, one, nc.ptr,
+		   nc.len, colon, one, cnonce.ptr, cnonce.len, colon, one, qop.ptr, qop.len,
+		   colon, one, ha2, sizeof(ha2) - 1, NULL);
+}
+
+/*
+ * Check for authentication timeout.
+ * Clients send time stamp encoded in nonce. Make sure it is not too old,
+ * to prevent replay attacks.
+ * Assumption: nonce is a hexadecimal number of seconds since 1970.
+ */
+static int mg_check_nonce(struct mg_str nonce) {
+	unsigned long now = (unsigned long) mg_time();
+	unsigned long val = (unsigned long) strtoul(nonce.ptr, NULL, 16);
+	return (now >= val) && (now - val < 60 * 60);
+}
+
+static int mg_check_digest_auth(struct mg_str method, struct mg_str uri,
+						 struct mg_str username, struct mg_str cnonce,
+						 struct mg_str response, struct mg_str qop,
+						 struct mg_str nc, struct mg_str nonce,
+						 struct mg_str auth_domain, FILE *fp)
+{
+	char buf[128], f_user[sizeof(buf)], f_ha1[sizeof(buf)], f_domain[sizeof(buf)];
+	char exp_resp[33];
+
+	/*
+	 * Read passwords file line by line. If should have htdigest format,
+	 * i.e. each line should be a colon-separated sequence:
+	 * USER_NAME:DOMAIN_NAME:HA1_HASH_OF_USER_DOMAIN_AND_PASSWORD
+	 */
+	while (fgets(buf, sizeof(buf), fp) != NULL) {
+		if (sscanf(buf, "%[^:]:%[^:]:%s", f_user, f_domain, f_ha1) == 3 &&
+			mg_vcmp(&username, f_user) == 0 &&
+			mg_vcmp(&auth_domain, f_domain) == 0) {
+			/* Username and domain matched, check the password */
+			mg_mkmd5resp(method, uri, mg_str_s(f_ha1), nonce, nc, cnonce, qop, exp_resp);
+			return mg_ncasecmp(response.ptr, exp_resp, strlen(exp_resp)) == 0;
+		}
+	}
+
+	/* None of the entries in the passwords file matched - return failure */
+	return 0;
+}
+
+static int mg_http_check_digest_auth(struct mg_http_message *hm, struct mg_str auth_domain, FILE *fp)
+{
+	struct mg_str *hdr;
+	struct mg_str username, cnonce, response, qop, nc, nonce;
+
+	/* Parse "Authorization:" header, fail fast on parse error */
+	if (hm == NULL ||
+		(hdr = mg_http_get_header(hm, "Authorization")) == NULL ||
+		(username = mg_http_get_header_var(*hdr, mg_str_n("username", 8))).len == 0 ||
+		(cnonce = mg_http_get_header_var(*hdr, mg_str_n("cnonce", 6))).len == 0 ||
+		(response = mg_http_get_header_var(*hdr, mg_str_n("response", 8))).len == 0 ||
+		mg_http_get_header_var(*hdr, mg_str_n("uri", 3)).len == 0 ||
+		(qop = mg_http_get_header_var(*hdr, mg_str_n("qop", 3))).len == 0 ||
+		(nc = mg_http_get_header_var(*hdr, mg_str_n("nc", 2))).len == 0 ||
+		(nonce = mg_http_get_header_var(*hdr, mg_str_n("nonce", 5))).len == 0 ||
+		mg_check_nonce(nonce) == 0) {
+		return 0;
+	}
+
+	/* Remove commas left behind by mg_http_get_header_var */
+	qop.len--;
+	nc.len--;
+
+	/* NOTE(lsm): due to a bug in MSIE, we do not compare URIs */
+
+	return mg_check_digest_auth(
+			hm->method,
+			mg_str_n(
+					hm->uri.ptr,
+					hm->uri.len + (hm->query.len ? hm->query.len + 1 : 0)),
+			username, cnonce, response, qop, nc, nonce, auth_domain, fp);
+}
+
+static int mg_http_is_authorized(struct mg_http_message *hm, const char *domain, const char *passwords_file) {
+	FILE *fp;
+	int authorized = 1;
+
+	if (domain != NULL && passwords_file != NULL) {
+		fp = fopen(passwords_file, "r");
+		if (fp != NULL) {
+			authorized = mg_http_check_digest_auth(hm, mg_str(domain), fp);
+			fclose(fp);
+		}
+	}
+
+	return authorized;
+}
+
+static void mg_http_send_digest_auth_request(struct mg_connection *c, const char *domain)
+{
+	mg_printf(c,
+			  "HTTP/1.1 401 Unauthorized\r\n"
+			  "WWW-Authenticate: Digest qop=\"auth\", "
+			  "realm=\"%s\", nonce=\"%lx\"\r\n"
+			  "Content-Length: 0\r\n\r\n",
+			  domain, (unsigned long) mg_time());
+}
 
 /*
  * These functions are for V2 of the protocol
@@ -100,46 +315,73 @@ static const char *get_source_string(unsigned int source)
 	return str[source];
 }
 
-static void restart_handler(struct mg_connection *nc, int ev, void *ev_data)
+static void restart_handler(struct mg_connection *nc, void *ev_data)
 {
-	struct http_message *hm = (struct http_message *) ev_data;
+	struct mg_http_message *hm = (struct mg_http_message *) ev_data;
 	ipc_message msg = {};
 
-	if (ev == MG_EV_HTTP_REQUEST) {
-		if(mg_vcasecmp(&hm->method, "POST") != 0) {
-			mg_http_send_error(nc, 405, "Method Not Allowed");
-			return;
+	if(mg_vcasecmp(&hm->method, "POST") != 0) {
+		mg_http_reply(nc, 405, "", "%s", "Method Not Allowed\n");
+		return;
+	}
+
+	int ret = ipc_postupdate(&msg);
+	if (ret) {
+		mg_http_reply(nc, 500, "", "%s", "Failed to queue command\n");
+		return;
+	}
+
+	mg_http_reply(nc, 201, "", "%s", "Device will reboot now.\n");
+}
+
+static void broadcast_callback(struct mg_connection *nc, int ev,
+		void __attribute__ ((__unused__)) *ev_data, void __attribute__ ((__unused__)) *fn_data)
+{
+	if (ev == MG_EV_READ) {
+		struct mg_connection *t;
+		struct ws_msg_elem *ws_msg;
+
+		pthread_mutex_lock(&ws_msg_lock);
+
+		while(!SIMPLEQ_EMPTY(&ws_messages)) {
+			ws_msg = SIMPLEQ_FIRST(&ws_messages);
+			SIMPLEQ_REMOVE_HEAD(&ws_messages, next);
+
+			pthread_mutex_unlock(&ws_msg_lock);
+
+			for (t = nc->mgr->conns; t != NULL; t = t->next) {
+				if (t->label[0] != 'W') continue;
+				mg_ws_send(t, ws_msg->msg, strlen(ws_msg->msg), WEBSOCKET_OP_TEXT);
+			}
+
+			free(ws_msg);
+			pthread_mutex_lock(&ws_msg_lock);
 		}
 
-		int ret = ipc_postupdate(&msg);
-		if (ret) {
-			mg_http_send_error(nc, 500, "Failed to queue command");
-			return;
-		}
-
-		mg_http_send_error(nc, 201, "Device will reboot now.");
+		pthread_mutex_unlock(&ws_msg_lock);
 	}
 }
 
-static void broadcast_callback(struct mg_connection *nc, int ev, void *ev_data)
+static void broadcast(char *str)
 {
-	char *buf = (char *) ev_data;
+	unsigned int len = str ? strlen(str) : 0;
+	struct ws_msg_elem *ws_msg = (struct ws_msg_elem*)calloc(1, sizeof(*ws_msg) + len + 1);
 
-	if (ev != MG_EV_POLL)
+	if (!ws_msg)
 		return;
 
-	if (!(nc->flags & MG_F_IS_WEBSOCKET))
-		return;
+	ws_msg->msg = (char *)ws_msg + sizeof(struct ws_msg_elem);
 
-	mg_send_websocket_frame(nc, WEBSOCKET_OP_TEXT, buf, strlen(buf));
+	if (str)
+		strncpy(ws_msg->msg, str, len);
+
+	pthread_mutex_lock(&ws_msg_lock);
+	SIMPLEQ_INSERT_TAIL(&ws_messages, ws_msg, next);
+	pthread_mutex_unlock(&ws_msg_lock);
+	mg_mgr_wakeup(ws_pipe);
 }
 
-static void broadcast(struct mg_mgr *mgr, char *str)
-{
-	mg_broadcast(mgr, broadcast_callback, str, strlen(str) + 1);
-}
-
-static void *broadcast_message_thread(void *data)
+static void *broadcast_message_thread(void __attribute__ ((__unused__)) *data)
 {
 	int fd = -1;
 
@@ -162,7 +404,6 @@ static void *broadcast_message_thread(void *data)
 			return NULL;
 
 		if (strlen(msg.data.notify.msg) != 0) {
-			struct mg_mgr *mgr = (struct mg_mgr *) data;
 			char text[4096];
 			char str[4160];
 
@@ -177,14 +418,12 @@ static void *broadcast_message_thread(void *data)
 					 msg.data.notify.level, /* RFC 5424 */
 					 text);
 
-			broadcast(mgr, str);
+			broadcast(str);
 		}
 	}
-
-	return NULL;
 }
 
-static void *broadcast_progress_thread(void *data)
+static void *broadcast_progress_thread(void __attribute__ ((__unused__)) *data)
 {
 	RECOVERY_STATUS status = -1;
 	sourcetype source = -1;
@@ -193,7 +432,6 @@ static void *broadcast_progress_thread(void *data)
 	int fd = -1;
 
 	for (;;) {
-		struct mg_mgr *mgr = (struct mg_mgr *) data;
 		struct progress_msg msg;
 		char str[512];
 		char escaped[512];
@@ -227,7 +465,7 @@ static void *broadcast_progress_thread(void *data)
 				"\t\"status\": \"%s\"\r\n"
 				"}\r\n",
 				escaped);
-			broadcast(mgr, str);
+			broadcast(str);
 		}
 
 		if (msg.source != source) {
@@ -239,7 +477,7 @@ static void *broadcast_progress_thread(void *data)
 				"\t\"source\": \"%s\"\r\n"
 				"}\r\n",
 				get_source_string(msg.source));
-			broadcast(mgr, str);
+			broadcast(str);
 		}
 
 		if (msg.status == SUCCESS && msg.source == SOURCE_WEBSERVER && run_postupdate) {
@@ -257,7 +495,7 @@ static void *broadcast_progress_thread(void *data)
 				"\t\"source\": \"%s\"\r\n"
 				"}\r\n",
 				escaped);
-			broadcast(mgr, str);
+			broadcast(str);
 		}
 
 		if ((msg.cur_step != step || msg.cur_percent != percent) &&
@@ -279,147 +517,157 @@ static void *broadcast_progress_thread(void *data)
 				msg.cur_step,
 				escaped,
 				msg.cur_percent);
-			broadcast(mgr, str);
+			broadcast(str);
 		}
 	}
-
-	return NULL;
 }
 
 /*
  * Code common to V1 and V2
  */
-static void upload_handler(struct mg_connection *nc, int ev, void *p)
+static void upload_handler(struct mg_connection *nc, int ev, void *ev_data,
+		void __attribute__ ((__unused__)) *fn_data)
 {
 	struct mg_http_multipart_part *mp;
 	struct file_upload_state *fus;
 	ssize_t written;
 
 	switch (ev) {
-	case MG_EV_HTTP_PART_BEGIN:
-		mp = (struct mg_http_multipart_part *) p;
+		case MG_EV_HTTP_PART_BEGIN:
+			mp = (struct mg_http_multipart_part *) ev_data;
 
-		fus = (struct file_upload_state *) calloc(1, sizeof(*fus));
-		if (fus == NULL) {
-			mg_http_send_error(nc, 500, "Out of memory");
+			fus = (struct file_upload_state *) calloc(1, sizeof(*fus));
+			if (fus == NULL) {
+				mg_http_reply(nc, 500, "", "%s", "Out of memory\n");
+				nc->is_closing = 1;
+				break;
+			}
+
+			struct swupdate_request req;
+			swupdate_prepare_req(&req);
+			req.len = mp->file_name.len;
+			strncpy(req.info, mp->file_name.ptr, sizeof(req.info) - 1);
+			req.source = SOURCE_WEBSERVER;
+			fus->fd = ipc_inst_start_ext(&req, sizeof(req));
+			if (fus->fd < 0) {
+				mg_http_reply(nc, 500, "", "%s", "Failed to queue command\n");
+				nc->is_closing = 1;
+				free(fus);
+				break;
+			}
+
+			if (swupdate_file_setnonblock(fus->fd, true)) {
+				WARN("IPC cannot be set in non-blocking, fallback to block mode");
+			}
+
+			mp->user_data = fus;
+
+			/*
+			 * There is no user data for connection.
+			 * Set the user data to the same structure to make it available
+			 * to the MG_TIMER event
+			 */
+			nc->fn_data = mp->user_data;
+
+			if (watchdog_conn > 0) {
+				TRACE("Setting Webserver Watchdog Timer to %d", watchdog_conn);
+				//mg_set_timer(nc, mg_time() + watchdog_conn);
+			}
+
 			break;
-		}
 
-		struct swupdate_request req;
-		swupdate_prepare_req(&req);
-		req.len = strlen(mp->file_name);
-		strncpy(req.info, mp->file_name, sizeof(req.info) - 1);
-		req.source = SOURCE_WEBSERVER;
-		fus->fd = ipc_inst_start_ext(&req, sizeof(req));
-		if (fus->fd < 0) {
-			mg_http_send_error(nc, 500, "Failed to queue command");
+		case MG_EV_HTTP_PART_DATA:
+			mp = (struct mg_http_multipart_part *) ev_data;
+			fus = (struct file_upload_state *) mp->user_data;
+
+			if (!fus)
+				break;
+
+			written = write(fus->fd, (char *) mp->data.ptr, mp->data.len);
+			/*
+			 * IPC seems to block, wait for a while
+			 */
+			if (written != mp->data.len) {
+				if (written < 0) {
+					if (errno != EAGAIN && errno != EWOULDBLOCK) {
+						if (!fus->error_report) {
+							ERROR("Writing to IPC fails due to %s", strerror(errno));
+							fus->error_report = true;
+							nc->is_closing = 1;
+						}
+						/*
+						 * Simply consumes the data to unblock the sender
+						 */
+						written = mp->data.len;
+					} else
+						written = 0;
+				}
+				usleep(100);
+			}
+
+			mp->num_data_consumed = written;
+			fus->len += written;
+
+			break;
+
+		case MG_EV_HTTP_PART_END:
+			mp = (struct mg_http_multipart_part *) ev_data;
+			fus = (struct file_upload_state *) mp->user_data;
+
+			if (!fus)
+				break;
+
+			ipc_end(fus->fd);
+
+			mg_http_reply(nc, 200, "%s",
+								  "Content-Type: text/plain\r\n"
+								  "Connection: close");
+			mg_send(nc, "\r\n", 2);
+			mg_printf(nc, "Ok, %s - %d bytes.\r\n", mp->file_name, (int) fus->len);
+			nc->is_closing = 1;
+
+			mp->user_data = NULL;
+			nc->fn_data = mp->user_data;
 			free(fus);
 			break;
-		}
-
-		if (swupdate_file_setnonblock(fus->fd, true)) {
-			WARN("IPC cannot be set in non-blocking, fallback to block mode");
-		}
-
-		mp->user_data = fus;
-
-		/*
-		 * There is no user data for connection.
-		 * Set the user data to the same structure to make it available
-		 * to the MG_TIMER event
-		 */
-		nc->user_data = mp->user_data;
-
-		if (watchdog_conn > 0) {
-			TRACE("Setting Webserver Watchdog Timer to %d", watchdog_conn);
-			mg_set_timer(nc, mg_time() + watchdog_conn);
-		}
-
-		break;
-
-	case MG_EV_HTTP_PART_DATA:
-		mp = (struct mg_http_multipart_part *) p;
-		fus = (struct file_upload_state *) mp->user_data;
-
-		if (!fus)
-			break;
-
-		written = write(fus->fd, (char *) mp->data.p, mp->data.len);
-		/*
-		 * IPC seems to block, wait for a while
-		 */
-		if (written != mp->data.len) {
-			if (written < 0) {
-				if (errno != EAGAIN && errno != EWOULDBLOCK) {
-					if (!fus->error_report) {
-						ERROR("Writing to IPC fails due to %s", strerror(errno));
-						fus->error_report = true;
-					}
-					/*
-					 * Simply consumes the data to unblock the sender
-					 */
-					written = mp->data.len;
-				} else
-					written = 0;
-			}
-			usleep(100);
-		}
-
-		mp->num_data_consumed = written;
-		fus->len += written;
-
-		break;
-
-	case MG_EV_HTTP_PART_END:
-		mp = (struct mg_http_multipart_part *) p;
-		fus = (struct file_upload_state *) mp->user_data;
-
-		if (!fus)
-			break;
-
-		ipc_end(fus->fd);
-
-		mg_send_response_line(nc, 200,
-			"Content-Type: text/plain\r\n"
-			"Connection: close");
-		mg_send(nc, "\r\n", 2);
-		mg_printf(nc, "Ok, %s - %d bytes.\r\n", mp->file_name, (int) fus->len);
-		nc->flags |= MG_F_SEND_AND_CLOSE;
-
-		mp->user_data = NULL;
-		nc->user_data = mp->user_data;
-		free(fus);
-		break;
 	}
 }
 
-static void ev_handler(struct mg_connection *nc, int ev, void *ev_data)
+static void websocket_handler(struct mg_connection *nc, void *ev_data)
 {
-	time_t now;
+	struct mg_http_message *hm = (struct mg_http_message *) ev_data;
+	mg_ws_upgrade(nc, hm, NULL);
+	nc->label[0] = 'W';
+}
 
-	switch (ev) {
-	case MG_EV_HTTP_REQUEST:
-		mg_serve_http(nc, ev_data, s_http_server_opts);
-		break;
-	case MG_EV_TIMER:
-		now = (time_t) mg_time();
-		/*
-		 * Check if a multi-part was initiated
-		 */
-		if (nc->user_data && (watchdog_conn > 0) &&
-			(difftime(now, nc->last_io_time) > watchdog_conn)) {
-			struct file_upload_state *fus;
-
-		       /* Connection lost, drop data */
-			ERROR("Connection lost, no data since %ld now %ld, closing...",
-				nc->last_io_time, now);
-			fus = (struct file_upload_state *) nc->user_data;
-			ipc_end(fus->fd);
-			nc->user_data = NULL;
-			nc->flags |= MG_F_CLOSE_IMMEDIATELY;
-		} else
-			mg_set_timer(nc, mg_time() + watchdog_conn);  // Send us timer event again after 0.5 seconds
-		break;
+static void ev_handler(struct mg_connection *nc, int ev, void *ev_data, void *fn_data)
+{
+	if (ev == MG_EV_HTTP_MSG) {
+		struct mg_http_message *hm = (struct mg_http_message *) ev_data;
+		if (!mg_http_is_authorized(hm, global_auth_domain, global_auth_file))
+			mg_http_send_digest_auth_request(nc, global_auth_domain);
+		else if (mg_http_get_header(hm, "Sec-WebSocket-Key") != NULL)
+			websocket_handler(nc, ev_data);
+		else if (mg_http_match_uri(hm, "/restart"))
+			restart_handler(nc, ev_data);
+		else
+			mg_http_serve_dir(nc, ev_data, &s_http_server_opts);
+	} else if (nc->label[0] != 'M' && ev == MG_EV_HTTP_CHUNK) {
+		struct mg_http_message *hm = (struct mg_http_message *) ev_data;
+		if (!mg_http_is_authorized(hm, global_auth_domain, global_auth_file))
+			mg_http_send_digest_auth_request(nc, global_auth_domain);
+		else if (mg_http_match_uri(hm, "/upload"))
+			multipart_upload_handler(nc, ev, ev_data, upload_handler, NULL);
+	} else if (nc->label[0] == 'M' && (ev == MG_EV_READ || ev == MG_EV_POLL)) {
+		multipart_upload_handler(nc, ev, ev_data, upload_handler, fn_data);
+#if MG_ENABLE_SSL
+	} else if (ev == MG_EV_ACCEPT && ssl) {
+		mg_tls_init(nc, &tls_opts);
+#endif
+	} else if (ev == MG_EV_ERROR) {
+		ERROR("%p %s", nc->fd, (char *) ev_data);
+	} else if (ev == MG_EV_WS_MSG) {
+		mg_iobuf_del(&nc->recv, 0, nc->recv.len);
 	}
 }
 
@@ -507,13 +755,12 @@ int start_mongoose(const char *cfgfname, int argc, char *argv[])
 	struct mongoose_options opts;
 	struct mg_mgr mgr;
 	struct mg_connection *nc;
-	struct mg_bind_opts bind_opts;
 	const char *s_http_port = NULL;
-	const char *err_str;
+	int choice;
+
 #if MG_ENABLE_SSL
-	bool ssl = false;
+	ssl = false;
 #endif
-	int choice = 0;
 
 	memset(&opts, 0, sizeof(opts));
 
@@ -584,61 +831,44 @@ int start_mongoose(const char *cfgfname, int argc, char *argv[])
 		}
 	}
 
-	s_http_server_opts.document_root =
+	s_http_server_opts.root_dir =
 		opts.root ? opts.root : MG_ROOT;
-	s_http_server_opts.enable_directory_listing =
-		opts.listing ? "yes" : "no";
+	if (!opts.listing)
+		s_http_server_opts.fs = &fs_posix_no_list;
 	s_http_port = opts.port ? opts.port : MG_PORT;
-	s_http_server_opts.global_auth_file = opts.global_auth_file;
-	s_http_server_opts.auth_domain = opts.auth_domain;
+	global_auth_file = opts.global_auth_file;
+	global_auth_domain = opts.auth_domain;
 
-	memset(&bind_opts, 0, sizeof(bind_opts));
-	bind_opts.error_string = &err_str;
 #if MG_ENABLE_SSL
 	if (ssl) {
-		bind_opts.ssl_cert = opts.ssl_cert;
-		bind_opts.ssl_key = opts.ssl_key;
+		tls_opts.cert = opts.ssl_cert;
+		tls_opts.certkey = opts.ssl_key;
 	}
 #endif
 
-	mg_mgr_init(&mgr, NULL);
+	signal(SIGINT, signal_handler);
+	signal(SIGTERM, signal_handler);
+	mg_mgr_init(&mgr);
 
-	nc = mg_bind_opt(&mgr, s_http_port, ev_handler, bind_opts);
+	SIMPLEQ_INIT(&ws_messages);
+
+	ws_pipe = mg_mkpipe(&mgr, broadcast_callback, NULL);
+	nc = mg_http_listen(&mgr, s_http_port, ev_handler, NULL);
 	if (nc == NULL) {
-		ERROR("Failed to start Mongoose: %s", *bind_opts.error_string);
+		ERROR("Failed to start Mongoose.");
 		exit(EXIT_FAILURE);
 	}
 
-	/*
-	 * The Event Handler in Webserver will read from socket until there is data.
-	 * This does not guarantes a flow control because data are forwarded
-	 * to SWUpdate internal IPC. If this is not called in blocking mode,
-	 * the Webserver should just read from socket to fill the IPC, but without
-	 * filling all memory.
-	 */
-	nc->recv_mbuf_limit = 256 * 1024;
-
-	mg_set_protocol_http_websocket(nc);
-	mg_register_http_endpoint(nc, "/restart", restart_handler);
-	mg_register_http_endpoint(nc, "/upload", MG_CB(upload_handler, NULL));
-	mg_start_thread(broadcast_message_thread, &mgr);
-	mg_start_thread(broadcast_progress_thread, &mgr);
+	start_thread(broadcast_message_thread, NULL);
+	start_thread(broadcast_progress_thread, NULL);
 
 	INFO("Mongoose web server version %s with pid %d started on port(s) %s with web root [%s]",
 		MG_VERSION, getpid(), s_http_port,
-		s_http_server_opts.document_root);
+		s_http_server_opts.root_dir);
 
-	for (;;) {
+	while (s_signo == 0)
 		mg_mgr_poll(&mgr, 100);
-	}
 	mg_mgr_free(&mgr);
 
 	return 0;
 }
-
-#if MG_ENABLE_SSL && MG_SSL_IF == MG_SSL_IF_MBEDTLS
-#include <mbedtls/ctr_drbg.h>
-int mg_ssl_if_mbed_random(void *ctx, unsigned char *buf, size_t len) {
-	return mbedtls_ctr_drbg_random(ctx, buf, len);
-}
-#endif
